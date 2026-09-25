@@ -1,0 +1,7 @@
+build/
+.DS_STORE
+ports/*/src/
+ports/*/*.tar.gz
+
+ports/*/build*/
+__pycache__/

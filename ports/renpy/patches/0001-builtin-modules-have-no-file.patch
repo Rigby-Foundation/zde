@@ -1,0 +1,11 @@
+--- a/renpy/__init__.py	2026-09-18 02:14:00
++++ b/renpy/__init__.py	2026-09-18 02:14:00
+@@ -308,7 +308,7 @@
+     name = package.__name__.split(".")
+ 
+     import _renpy
+-    libexec = os.path.dirname(_renpy.__file__)
++    libexec = os.path.dirname(getattr(_renpy, "__file__", ""))   # sic: the modules are built in
+     package.__path__.append(os.path.join(libexec, *name))
+ 
+     # Also find encodings, to deal with the way py2exe lays things out.

@@ -1,0 +1,4 @@
+build/
+src/
+sdl2.tar.gz
+.DS_STORE

@@ -1,0 +1,33 @@
+--- a/src/video/SDL_video.c
++++ b/src/video/SDL_video.c
+@@ -140,6 +140,9 @@
+ #ifdef SDL_VIDEO_DRIVER_NGAGE
+     &NGAGE_bootstrap,
+ #endif
++#ifdef SDL_VIDEO_DRIVER_ZWM
++    &ZWM_bootstrap,
++#endif
+ #ifdef SDL_VIDEO_DRIVER_OFFSCREEN
+     &OFFSCREEN_bootstrap,
+ #endif
+--- a/src/video/SDL_sysvideo.h
++++ b/src/video/SDL_sysvideo.h
+@@ -473,6 +473,7 @@
+ extern VideoBootStrap RPI_bootstrap;
+ extern VideoBootStrap KMSDRM_bootstrap;
+ extern VideoBootStrap KMSDRM_LEGACY_bootstrap;
++extern VideoBootStrap ZWM_bootstrap;
+ extern VideoBootStrap DUMMY_bootstrap;
+ extern VideoBootStrap DUMMY_evdev_bootstrap;
+ extern VideoBootStrap Wayland_bootstrap;
+--- a/src/dynapi/SDL_dynapi.h
++++ b/src/dynapi/SDL_dynapi.h
+@@ -59,6 +59,8 @@
+ #define SDL_DYNAMIC_API 0
+ #elif defined(__riscos__) && __riscos__ /* probably not useful on RISC OS, since dlopen() can't be used when using static linking. */
+ #define SDL_DYNAMIC_API 0
++#elif defined(__sic__) /* sic: static linking only, no dlopen */
++#define SDL_DYNAMIC_API 0
+ #elif defined(__clang_analyzer__) || defined(SDL_THREAD_SAFETY_ANALYSIS)
+ #define SDL_DYNAMIC_API 0 /* Turn off for static analysis, so reports are more clear. */
+ #elif defined(__VITA__)
