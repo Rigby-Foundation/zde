@@ -4,8 +4,8 @@
  * (a dot under the ones that have a window open), then any other window.
  * Click an icon to bring its window up, or back from minimized; click the
  * one in front to put it away; click a launcher with nothing open to start
- * it. The name of what is under the mouse shows above the tray, the uptime
- * sits in the corner. Re-spawned by zde if it dies. */
+ * it. The name of what is under the mouse shows above the tray (the clock
+ * is in the bar at the top). Re-spawned by zde if it dies. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -121,11 +121,6 @@ static void draw(void)
         zwm_round_rect(s, lx, 0, lw, 20 * S, 6 * S, ZWM_COL_SURFACE);
         zwm_ttext(s, lx + 8 * S, (20 * S - zwm_ttext_height(ZWM_UI_PX)) / 2, label, ZWM_COL_TEXT, ZWM_UI_PX);
     }
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    char buf[32];
-    snprintf(buf, sizeof buf, "%02ld:%02ld:%02ld", (long)(ts.tv_sec / 3600), (long)(ts.tv_sec / 60 % 60), (long)(ts.tv_sec % 60));
-    zwm_ttext(s, s->w - zwm_ttext_width(buf, ZWM_UI_PX) - 12 * S, TRAY_Y + (TRAY_H - zwm_ttext_height(ZWM_UI_PX)) / 2, buf, ZWM_COL_TEXT_DIM, ZWM_UI_PX);
 }
 
 static int item_at(int x, int y)

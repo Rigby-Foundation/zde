@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
-/* zde: the session. Starts the window server, then the panel, and waits;
+/* zde: the session. Starts the window server, then the bar and the panel, and waits;
  * when the server ends (Ctrl+Alt+Q) everything else is taken down and the
  * console comes back. `zde` from the shell is all it takes; `zde prog args`
  * also starts prog once the desktop is up (its output stays on the
@@ -48,16 +48,19 @@ int main(int argc, char **argv)
     }
     if (!c) { fprintf(stderr, "zde: zwm did not come up\n"); kill(wm, SIGTERM); return 1; }
     zwm_disconnect(c);
+    pid_t bar = spawn("/bin/zbar", NULL);
     pid_t panel = spawn("/bin/zpanel", NULL);
     if (argc > 1) spawnv(argv + 1);
     for (;;) {
         int st;
         pid_t p = wait(&st);
         if (p == wm) break;
-        if (p == panel) panel = spawn("/bin/zpanel", NULL);     /* keep the panel around */
+        if (p == panel) panel = spawn("/bin/zpanel", NULL);     /* keep the panel and the bar around */
+        if (p == bar) bar = spawn("/bin/zbar", NULL);
         if (p < 0) break;
     }
     if (panel > 0) kill(panel, SIGTERM);
+    if (bar > 0) kill(bar, SIGTERM);
     /* programs the panel started notice the server is gone and exit themselves */
     printf("zde: session ended\n");
     return 0;

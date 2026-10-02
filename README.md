@@ -5,7 +5,10 @@ panel starts. Optional, like zwm; `make install` puts the binaries into the
 sysroot's `rootfs/` overlay and ZAE packs them into the initrd.
 
 ```
-zde       starts zwm and the panel, waits, tidies up when the server ends
+zde       starts zwm, the bar and the panel, waits, tidies up when the server ends
+zbar      the bar at the top: the system menu (start an app), the app in
+          front (minimize, maximize, close), the volume (a slider and mute;
+          kept in /disk/.volume) and the date
 zpanel    the dock at the bottom: a tray of icons, the launchpad and the
           launchers (a dot under the ones with a window open) then any other
           window. Click to raise or bring back, click the one in front to put it
