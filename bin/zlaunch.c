@@ -2,7 +2,7 @@
 /* Copyright (C) 2026 Rigby Foundation */
 /* zlaunch: the launchpad. A sheet over the whole work area with every app
  * on it: the programs in /bin that carry an icon, and the executables at
- * the top of each mounted volume (games). Click one to start it (in its
+ * the top of each mounted volume and of each /games/<name> (games). Click one to start it (in its
  * own directory) and the sheet goes; Escape or a click on nothing closes
  * it. The dock's first button opens it. */
 #include <stdio.h>
@@ -64,17 +64,20 @@ static void scan(void)
     if (d) closedir(d);
     qsort(apps, (size_t)napps, sizeof apps[0], cmp);
     int nbin = napps;
-    d = opendir("/mnt");
-    while (d && (e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        char vol[160];
-        snprintf(vol, sizeof vol, "/mnt/%s", e->d_name);
-        DIR *v = opendir(vol);
-        struct dirent *f;
-        while (v && (f = readdir(v))) if (f->d_name[0] != '.') add(vol, f->d_name, 0);
-        if (v) closedir(v);
+    static const char *const roots[] = { "/mnt", "/games" };   /* mounted volumes, games bundled into the image */
+    for (int r = 0; r < 2; r++) {
+        d = opendir(roots[r]);
+        while (d && (e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            char vol[160];
+            snprintf(vol, sizeof vol, "%s/%s", roots[r], e->d_name);
+            DIR *v = opendir(vol);
+            struct dirent *f;
+            while (v && (f = readdir(v))) if (f->d_name[0] != '.') add(vol, f->d_name, 0);
+            if (v) closedir(v);
+        }
+        if (d) closedir(d);
     }
-    if (d) closedir(d);
     qsort(apps + nbin, (size_t)(napps - nbin), sizeof apps[0], cmp);
 }
 
