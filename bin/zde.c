@@ -10,6 +10,9 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <abi/fb.h>
 #include <zwm.h>
 
 static pid_t spawn(const char *path, const char *arg)
@@ -36,6 +39,17 @@ static pid_t spawnv(char **argv)
 
 int main(int argc, char **argv)
 {
+    if (!getenv("ZWM_SCALE")) {
+        int fb_fd = open("/dev/fb0", O_RDONLY);
+        if (fb_fd >= 0) {
+            struct fb_var_screeninfo v;
+            if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &v) == 0) {
+                if (v.xres >= 2000 || v.yres >= 2000)
+                    setenv("ZWM_SCALE", "2", 1);
+            }
+            close(fb_fd);
+        }
+    }
     pid_t wm = spawn("/bin/zwm", NULL);
     if (wm < 0) { perror("zde: fork"); return 1; }
     /* the server is up once it accepts a connection */
