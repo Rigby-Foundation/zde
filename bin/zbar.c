@@ -3,7 +3,7 @@
 /* zbar: the bar across the top. On the left the system menu (start an
  * app) and the name of the app in front, whose menu minimizes, maximizes
  * or closes its window; on the right the brightness (a phone's panel), the
- * volume and the date. The volume opens a slider (and a mute button) over
+ * volume, the battery (/dev/battery) and the date. The volume opens a slider (and a mute button) over
  * /dev/mixer, and is kept in /disk/.volume when a disk is mounted, so the
  * next session starts where this one left off; the brightness opens a
  * slider over /dev/panel, kept in /disk/.brightness. Menus are small
@@ -197,9 +197,51 @@ static void draw_sun(zwm_surface *s, int x, int y, int size, int pct, uint32_t c
         }
 }
 
+/* ---- the battery ------------------------------------------------------------------- */
+
+static int battery = -1, charging;  /* percent; -1: no battery */
+static time_t battery_at;
+
+static void battery_read(void)
+{
+    time_t now = time(NULL);
+    if (battery_at && now - battery_at < 10 && now >= battery_at) return;     /* the gauge changes slowly */
+    battery_at = now;
+    int fd = open("/dev/battery", O_RDONLY);
+    if (fd < 0) { battery = -1; return; }
+    char buf[512];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    battery = -1;
+    if (n <= 0) return;
+    buf[n] = 0;
+    int v;
+    char *p = strstr(buf, "capacity ");
+    if (p && sscanf(p, "capacity %d", &v) == 1 && v >= 0 && v <= 100) battery = v;
+    charging = strstr(buf, "status charging") || strstr(buf, "status full");
+}
+
+/* A battery on its side, filled as far as it is charged, with a bolt while charging. */
+static void draw_battery(zwm_surface *s, int x, int y, int h, int pct, int bolt, uint32_t col)
+{
+    int w = h * 2 - 2 * S;
+    zwm_round_rect_border(s, x, y, w, h, 3 * S, col);
+    zwm_fill(s, x + w, y + h / 3, 2 * S, h - 2 * (h / 3), col);
+    int in = 2 * S, fw = (w - 2 * in) * pct / 100;
+    uint32_t fill = pct <= 15 && !bolt ? 0xE5484D : col;
+    if (fw > 0) zwm_round_rect(s, x + in, y + in, fw, h - 2 * in, S, fill);
+    if (bolt) {                                         /* a zig-zag, dark over the fill */
+        int cx = x + w / 2, top = y + 2 * S, bot = y + h - 2 * S, mid = (top + bot) / 2;
+        for (int yy = top; yy <= bot; yy++) {
+            int off = yy < mid ? (mid - yy) * 3 / 4 : -(yy - mid) * 3 / 4;
+            zwm_fill(s, cx + off - S, yy, 2 * S, 1, ZWM_COL_PANEL);
+        }
+    }
+}
+
 /* ---- the bar ---------------------------------------------------------------------- */
 
-enum { ITEM_SYS, ITEM_APP, ITEM_BRIGHT, ITEM_VOL, ITEM_CLOCK, NITEMS };
+enum { ITEM_SYS, ITEM_APP, ITEM_BRIGHT, ITEM_VOL, ITEM_BATT, ITEM_CLOCK, NITEMS };
 static int item_x[NITEMS], item_w[NITEMS];
 static int hover = -1, open_item = -1;
 static char clock_text[40];
@@ -222,8 +264,10 @@ static void layout(void)
     item_w[ITEM_APP] = zwm_ttext_width_w(app_name, px, ZWM_FONT_MEDIUM) + 2 * PAD;
     item_w[ITEM_CLOCK] = zwm_ttext_width(clock_text, px) + 2 * PAD;
     item_x[ITEM_CLOCK] = bs->w - 4 * S - item_w[ITEM_CLOCK];
+    item_w[ITEM_BATT] = battery < 0 ? 0 : 26 * S + zwm_ttext_width("100%", px) + 2 * PAD;
+    item_x[ITEM_BATT] = item_x[ITEM_CLOCK] - item_w[ITEM_BATT];
     item_w[ITEM_VOL] = volume < 0 ? 0 : 16 * S + zwm_ttext_width("100%", px) + 2 * PAD;
-    item_x[ITEM_VOL] = item_x[ITEM_CLOCK] - item_w[ITEM_VOL];
+    item_x[ITEM_VOL] = item_x[ITEM_BATT] - item_w[ITEM_VOL];
     item_w[ITEM_BRIGHT] = panel < 0 ? 0 : 16 * S + zwm_ttext_width("100%", px) + 2 * PAD;
     item_x[ITEM_BRIGHT] = item_x[ITEM_VOL] - item_w[ITEM_BRIGHT];
 }
@@ -249,6 +293,13 @@ static void draw_bar(void)
             if (brightness >= 0) snprintf(pct, sizeof pct, "%d%%", brightness);
             else snprintf(pct, sizeof pct, "-");
             zwm_ttext(bs, x + 18 * S, ty, pct, ZWM_COL_TEXT_DIM, px);
+            break;
+        }
+        case ITEM_BATT: {
+            draw_battery(bs, x, (BAR_H - 11 * S) / 2, 11 * S, battery, charging, ZWM_COL_TEXT);
+            char pct[8];
+            snprintf(pct, sizeof pct, "%d%%", battery);
+            zwm_ttext(bs, x + 26 * S, ty, pct, ZWM_COL_TEXT_DIM, px);
             break;
         }
         case ITEM_VOL: {
@@ -432,6 +483,7 @@ int main(void)
     bs = zwm_window_surface(c, bar, g.w, g.h);
     volume_load();
     brightness_load();
+    battery_read();
     clock_update();
     draw_bar();
     zwm_flush(c, bar, bs);
@@ -459,11 +511,11 @@ int main(void)
             }
             if (ev.type == ZWM_S_MOUSE) {
                 int b = bar_item_at(ev.mouse.x, ev.mouse.y);
-                if (ev.mouse.kind == ZWM_MOUSE_PRESS && (ev.mouse.buttons & ZWM_BTN_LEFT) && b != ITEM_CLOCK) {
+                if (ev.mouse.kind == ZWM_MOUSE_PRESS && (ev.mouse.buttons & ZWM_BTN_LEFT) && b != ITEM_CLOCK && b != ITEM_BATT) {
                     if (b == open_item) close_pop();
                     else if (b >= 0) open_pop(b);
                 }
-                hover = b == ITEM_CLOCK ? -1 : b;
+                hover = b == ITEM_CLOCK || b == ITEM_BATT ? -1 : b;
             } else if (ev.type == ZWM_S_RESIZE && (int)ev.win == bar) {
                 zwm_surface_resize(bs, ev.geom.w, ev.geom.h);
             } else if (ev.type == ZWM_S_WINDOWS) {
@@ -475,6 +527,7 @@ int main(void)
         if (r < 0) break;
         if (pop >= 0 && pop_dirty) { draw_pop(); zwm_flush(c, pop, ps); }
         if (pop < 0) volume_read();             /* someone else may have changed it */
+        battery_read();
         clock_update();
         draw_bar();
         zwm_flush(c, bar, bs);
