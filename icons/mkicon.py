@@ -125,6 +125,14 @@ def icon_zlaunch(c):
         for j in range(3):
             c.rrect(11 + i * 10, 11 + j * 10, 6, 6, 2, WHITE if (i + j) % 2 == 0 else DIM)
 
+def icon_zwifi(c):
+    import math
+    tile(c, 0x2563eb, 0x1e3a8a)
+    for r in (21, 14, 7):
+        pts = [(24 + r * math.sin(math.radians(a)), 33 - r * math.cos(math.radians(a))) for a in range(-45, 46, 5)]
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]): c.line(x0, y0, x1, y1, 3, WHITE)
+    c.disc(24, 34, 2.5, WHITE)
+
 def icon_gldemo(c):
     tile(c, 0x1e3a5f, 0x0f172a)
     c.poly([(24, 9), (38, 16), (24, 23), (10, 16)], rgba(0x93c5fd))

@@ -4,7 +4,8 @@
  * app) and the name of the app in front, whose menu minimizes, maximizes
  * or closes its window; on the right the brightness (a phone's panel), the
  * volume, the battery (/dev/battery) and the date; on a phone, a keyboard
- * button before them starts and stops the one on the screen (zkbd). The volume opens a slider (and a mute button) over
+ * button before them starts and stops the one on the screen (zkbd), and
+ * a Wi-Fi one (when the kernel has /dev/wlan) opens zwifi. The volume opens a slider (and a mute button) over
  * /dev/mixer, and is kept in /disk/.volume when a disk is mounted, so the
  * next session starts where this one left off; the brightness opens a
  * slider over /dev/panel, kept in /disk/.brightness. Menus are small
@@ -262,9 +263,48 @@ static void draw_keyboard(zwm_surface *s, int x, int y, int h, uint32_t col)
     zwm_fill(s, x + w / 4, y + h - 4 * S, w / 2, k, col);
 }
 
+/* ---- the Wi-Fi ---------------------------------------------------------------------- */
+
+static int wifi = -1;               /* -1: no /dev/wlan; 0 off; 1 starting; 2 on; 3 failed */
+
+static void wifi_read(void)
+{
+    char buf[256];
+    int fd = open("/dev/wlan", O_RDONLY);
+    if (fd < 0) { wifi = -1; return; }
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    buf[n > 0 ? n : 0] = 0;
+    wifi = !strncmp(buf, "state ready", 11) || !strncmp(buf, "state connected", 15) ? 2 : !strncmp(buf, "state starting", 14) ? 1 :
+           !strncmp(buf, "state failed", 12) ? 3 : 0;
+}
+
+/* Three arcs over a dot, a quarter circle wide; dim when the Wi-Fi is off. */
+static void draw_wifi(zwm_surface *s, int x, int y, int size, int st, uint32_t col)
+{
+    uint32_t on = st == 2 ? col : st == 3 ? ZWM_COL_DANGER : ZWM_COL_TEXT_DIM;
+    int cx = x + size / 2, cy = y + size - S;
+    int t = size / 9 > 1 ? size / 9 : 1;
+    for (int py = y; py < y + size; py++)
+        for (int px = x; px < x + size; px++) {
+            int dx = px - cx, dy = cy - py;
+            if (dy <= 0 || dx > dy || -dx > dy) continue;      /* within 45 degrees of straight up */
+            int d2 = dx * dx + dy * dy;
+            for (int k = 1; k <= 3; k++) {
+                int r = size * k / 3 - t, r0 = r - t, r1 = r + t / 2;
+                if (k == 3) r1 = r;
+                if (d2 >= r0 * r0 && d2 <= r1 * r1) {
+                    uint32_t c = st == 1 && k == 3 ? ZWM_COL_TEXT_DIM : on;
+                    zwm_blend(s, px, py, c, 255);
+                }
+            }
+        }
+    zwm_disc(s, cx, cy - t, t, on);
+}
+
 /* ---- the bar ---------------------------------------------------------------------- */
 
-enum { ITEM_SYS, ITEM_APP, ITEM_KBD, ITEM_BRIGHT, ITEM_VOL, ITEM_BATT, ITEM_CLOCK, NITEMS };
+enum { ITEM_SYS, ITEM_APP, ITEM_KBD, ITEM_WIFI, ITEM_BRIGHT, ITEM_VOL, ITEM_BATT, ITEM_CLOCK, NITEMS };
 static int item_x[NITEMS], item_w[NITEMS];
 static int hover = -1, open_item = -1;
 static char clock_text[40];
@@ -293,8 +333,10 @@ static void layout(void)
     item_x[ITEM_VOL] = item_x[ITEM_BATT] - item_w[ITEM_VOL];
     item_w[ITEM_BRIGHT] = panel < 0 ? 0 : 16 * S + zwm_ttext_width("100%", px) + 2 * PAD;
     item_x[ITEM_BRIGHT] = item_x[ITEM_VOL] - item_w[ITEM_BRIGHT];
+    item_w[ITEM_WIFI] = wifi < 0 ? 0 : 16 * S + 2 * PAD;
+    item_x[ITEM_WIFI] = item_x[ITEM_BRIGHT] - item_w[ITEM_WIFI];
     item_w[ITEM_KBD] = touch_device ? 18 * S + 2 * PAD : 0;
-    item_x[ITEM_KBD] = item_x[ITEM_BRIGHT] - item_w[ITEM_KBD];
+    item_x[ITEM_KBD] = item_x[ITEM_WIFI] - item_w[ITEM_KBD];
 }
 
 static void draw_bar(void)
@@ -314,6 +356,9 @@ static void draw_bar(void)
         case ITEM_CLOCK: zwm_ttext(bs, x, ty, clock_text, ZWM_COL_TEXT, px); break;
         case ITEM_KBD:
             draw_keyboard(bs, x, (BAR_H - 12 * S) / 2, 12 * S, ZWM_COL_TEXT);
+            break;
+        case ITEM_WIFI:
+            draw_wifi(bs, x, (BAR_H - 16 * S) / 2, 16 * S, wifi, ZWM_COL_TEXT);
             break;
         case ITEM_BRIGHT: {
             draw_sun(bs, x, (BAR_H - 14 * S) / 2, 14 * S, brightness, ZWM_COL_TEXT);
@@ -513,6 +558,7 @@ int main(void)
     volume_load();
     brightness_load();
     battery_read();
+    wifi_read();
     clock_update();
     draw_bar();
     zwm_flush(c, bar, bs);
@@ -543,6 +589,9 @@ int main(void)
                 if (ev.mouse.kind == ZWM_MOUSE_PRESS && (ev.mouse.buttons & ZWM_BTN_LEFT) && b == ITEM_KBD) {
                     close_pop();
                     toggle_keyboard();
+                } else if (ev.mouse.kind == ZWM_MOUSE_PRESS && (ev.mouse.buttons & ZWM_BTN_LEFT) && b == ITEM_WIFI) {
+                    close_pop();
+                    launch("/bin/zwifi");
                 } else if (ev.mouse.kind == ZWM_MOUSE_PRESS && (ev.mouse.buttons & ZWM_BTN_LEFT) && b != ITEM_CLOCK && b != ITEM_BATT) {
                     if (b == open_item) close_pop();
                     else if (b >= 0) open_pop(b);
@@ -560,6 +609,7 @@ int main(void)
         if (pop >= 0 && pop_dirty) { draw_pop(); zwm_flush(c, pop, ps); }
         if (pop < 0) volume_read();             /* someone else may have changed it */
         battery_read();
+        wifi_read();
         clock_update();
         draw_bar();
         zwm_flush(c, bar, bs);
