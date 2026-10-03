@@ -3,7 +3,8 @@
 /* zbar: the bar across the top. On the left the system menu (start an
  * app) and the name of the app in front, whose menu minimizes, maximizes
  * or closes its window; on the right the brightness (a phone's panel), the
- * volume, the battery (/dev/battery) and the date. The volume opens a slider (and a mute button) over
+ * volume, the battery (/dev/battery) and the date; on a phone, a keyboard
+ * button before them starts and stops the one on the screen (zkbd). The volume opens a slider (and a mute button) over
  * /dev/mixer, and is kept in /disk/.volume when a disk is mounted, so the
  * next session starts where this one left off; the brightness opens a
  * slider over /dev/panel, kept in /disk/.brightness. Menus are small
@@ -228,7 +229,7 @@ static void draw_battery(zwm_surface *s, int x, int y, int h, int pct, int bolt,
     zwm_round_rect_border(s, x, y, w, h, 3 * S, col);
     zwm_fill(s, x + w, y + h / 3, 2 * S, h - 2 * (h / 3), col);
     int in = 2 * S, fw = (w - 2 * in) * pct / 100;
-    uint32_t fill = pct <= 15 && !bolt ? 0xE5484D : col;
+    uint32_t fill = pct <= 15 && !bolt ? ZWM_COL_DANGER : col;
     if (fw > 0) zwm_round_rect(s, x + in, y + in, fw, h - 2 * in, S, fill);
     if (bolt) {                                         /* a zig-zag, dark over the fill */
         int cx = x + w / 2, top = y + 2 * S, bot = y + h - 2 * S, mid = (top + bot) / 2;
@@ -239,9 +240,31 @@ static void draw_battery(zwm_surface *s, int x, int y, int h, int pct, int bolt,
     }
 }
 
+/* ---- the keyboard on the screen --------------------------------------------------- */
+
+static int touch_device;            /* a phone: a panel, or a portrait screen */
+static pid_t kbd_pid;
+
+static void toggle_keyboard(void)
+{
+    if (kbd_pid > 0 && kill(kbd_pid, 0) == 0) { kill(kbd_pid, SIGTERM); kbd_pid = 0; return; }
+    kbd_pid = fork();
+    if (kbd_pid == 0) { execl("/bin/zkbd", "zkbd", (char *)NULL); _exit(127); }
+}
+
+/* A keyboard: an outline, two rows of keys and a space bar. */
+static void draw_keyboard(zwm_surface *s, int x, int y, int h, uint32_t col)
+{
+    int w = h * 3 / 2, k = S + S / 2 > 1 ? S + S / 2 : 1;
+    zwm_round_rect_border(s, x, y, w, h, 2 * S, col);
+    for (int row = 0; row < 2; row++)
+        for (int i = 0; i < 4; i++) zwm_fill(s, x + 3 * S + i * (w - 6 * S) / 4, y + 3 * S + row * (h / 4), k, k, col);
+    zwm_fill(s, x + w / 4, y + h - 4 * S, w / 2, k, col);
+}
+
 /* ---- the bar ---------------------------------------------------------------------- */
 
-enum { ITEM_SYS, ITEM_APP, ITEM_BRIGHT, ITEM_VOL, ITEM_BATT, ITEM_CLOCK, NITEMS };
+enum { ITEM_SYS, ITEM_APP, ITEM_KBD, ITEM_BRIGHT, ITEM_VOL, ITEM_BATT, ITEM_CLOCK, NITEMS };
 static int item_x[NITEMS], item_w[NITEMS];
 static int hover = -1, open_item = -1;
 static char clock_text[40];
@@ -270,6 +293,8 @@ static void layout(void)
     item_x[ITEM_VOL] = item_x[ITEM_BATT] - item_w[ITEM_VOL];
     item_w[ITEM_BRIGHT] = panel < 0 ? 0 : 16 * S + zwm_ttext_width("100%", px) + 2 * PAD;
     item_x[ITEM_BRIGHT] = item_x[ITEM_VOL] - item_w[ITEM_BRIGHT];
+    item_w[ITEM_KBD] = touch_device ? 18 * S + 2 * PAD : 0;
+    item_x[ITEM_KBD] = item_x[ITEM_BRIGHT] - item_w[ITEM_KBD];
 }
 
 static void draw_bar(void)
@@ -287,6 +312,9 @@ static void draw_bar(void)
         case ITEM_SYS:   zwm_ttext_w(bs, x, ty, "sic", ZWM_COL_TEXT, px, ZWM_FONT_MEDIUM); break;
         case ITEM_APP:   zwm_ttext_w(bs, x, ty, app_name, ZWM_COL_TEXT, px, ZWM_FONT_MEDIUM); break;
         case ITEM_CLOCK: zwm_ttext(bs, x, ty, clock_text, ZWM_COL_TEXT, px); break;
+        case ITEM_KBD:
+            draw_keyboard(bs, x, (BAR_H - 12 * S) / 2, 12 * S, ZWM_COL_TEXT);
+            break;
         case ITEM_BRIGHT: {
             draw_sun(bs, x, (BAR_H - 14 * S) / 2, 14 * S, brightness, ZWM_COL_TEXT);
             char pct[8];
@@ -480,6 +508,7 @@ int main(void)
     bar = zwm_create(c, 100, BAR_H, "bar", ZWM_DOCK_TOP | ZWM_TASKBAR, &g);
     if (bar < 0) return 1;
     bar_y = g.y;                    /* below a camera cutout, on a phone */
+    touch_device = g.screen_h > g.screen_w || access("/dev/panel", F_OK) == 0;
     bs = zwm_window_surface(c, bar, g.w, g.h);
     volume_load();
     brightness_load();
@@ -511,7 +540,10 @@ int main(void)
             }
             if (ev.type == ZWM_S_MOUSE) {
                 int b = bar_item_at(ev.mouse.x, ev.mouse.y);
-                if (ev.mouse.kind == ZWM_MOUSE_PRESS && (ev.mouse.buttons & ZWM_BTN_LEFT) && b != ITEM_CLOCK && b != ITEM_BATT) {
+                if (ev.mouse.kind == ZWM_MOUSE_PRESS && (ev.mouse.buttons & ZWM_BTN_LEFT) && b == ITEM_KBD) {
+                    close_pop();
+                    toggle_keyboard();
+                } else if (ev.mouse.kind == ZWM_MOUSE_PRESS && (ev.mouse.buttons & ZWM_BTN_LEFT) && b != ITEM_CLOCK && b != ITEM_BATT) {
                     if (b == open_item) close_pop();
                     else if (b >= 0) open_pop(b);
                 }
