@@ -2,11 +2,13 @@
 /* Copyright (C) 2026 Rigby Foundation */
 /* zbar: the bar across the top. On the left the system menu (start an
  * app) and the name of the app in front, whose menu minimizes, maximizes
- * or closes its window; on the right the volume and the date. The volume
- * opens a slider (and a mute button) over /dev/mixer, and is kept in
- * /disk/.volume when a disk is mounted, so the next session starts where
- * this one left off. Menus are small undecorated windows that go away
- * when they lose the focus. Re-spawned by zde if it dies. */
+ * or closes its window; on the right the brightness (a phone's panel), the
+ * volume and the date. The volume opens a slider (and a mute button) over
+ * /dev/mixer, and is kept in /disk/.volume when a disk is mounted, so the
+ * next session starts where this one left off; the brightness opens a
+ * slider over /dev/panel, kept in /disk/.brightness. Menus are small
+ * undecorated windows that go away when they lose the focus. Re-spawned by
+ * zde if it dies. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +30,8 @@
 #define VOL_W    (240 * S)
 #define VOL_H    (48 * S)
 #define VOLUME_FILE "/disk/.volume"
+#define BRIGHTNESS_FILE "/disk/.brightness"
+#define BRIGHTNESS_MIN 3            /* percent: lower is black on some panels */
 
 static zwm *c;
 static int bar = -1, bar_y;           /* bar_y: below a camera cutout, on a phone */
@@ -125,9 +129,77 @@ static void draw_speaker(zwm_surface *s, int x, int y, int size, int vol, uint32
     }
 }
 
+/* ---- the brightness ---------------------------------------------------------------- */
+
+static int panel = -1;              /* /dev/panel, for commands */
+static int brightness = -1;         /* percent; -1: no panel, or not known yet */
+static int panel_max = 2047;        /* its top level, as the kernel says */
+
+/* "brightness N/MAX on|off": the level, if the kernel knows it. */
+static void brightness_read(void)
+{
+    int fd = open("/dev/panel", O_RDONLY);
+    if (fd < 0) return;
+    char buf[160];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+    int level, max;
+    if (sscanf(buf, "brightness %d/%d", &level, &max) == 2 && max > 0) { panel_max = max; brightness = (level * 100 + max / 2) / max; }
+    else if (sscanf(buf, "brightness ?/%d", &max) == 1 && max > 0) panel_max = max;
+}
+
+static void brightness_set(int v)
+{
+    if (panel < 0) return;
+    if (v < BRIGHTNESS_MIN) v = BRIGHTNESS_MIN;
+    if (v > 100) v = 100;
+    char buf[32];
+    int n = snprintf(buf, sizeof buf, "brightness %d\n", (v * panel_max + 50) / 100);
+    if (write(panel, buf, (size_t)n) == n) brightness = v;
+}
+
+static void brightness_save(void)
+{
+    int fd = open(BRIGHTNESS_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    char buf[16];
+    int n = snprintf(buf, sizeof buf, "%d\n", brightness);
+    if (write(fd, buf, (size_t)n) != n) { /* nothing to do */ }
+    close(fd);
+}
+
+static void brightness_load(void)
+{
+    panel = open("/dev/panel", O_WRONLY);
+    if (panel < 0) return;
+    brightness_read();
+    int fd = open(BRIGHTNESS_FILE, O_RDONLY);
+    if (fd < 0) return;
+    char buf[16] = { 0 };
+    if (read(fd, buf, sizeof buf - 1) > 0 && atoi(buf) > 0) brightness_set(atoi(buf));
+    close(fd);
+}
+
+/* A sun: a disc and eight rays, longer the brighter. */
+static void draw_sun(zwm_surface *s, int x, int y, int size, int pct, uint32_t col)
+{
+    int cx = x + size / 2, cy = y + size / 2, r = size / 5 + 1;
+    zwm_disc(s, cx, cy, r, col);
+    static const int dir[8][2] = { { 2, 0 }, { 1, 1 }, { 0, 2 }, { -1, 1 }, { -2, 0 }, { -1, -1 }, { 0, -2 }, { 1, -1 } };
+    int len = pct < 0 ? size / 4 : size / 8 + (size / 4 - size / 8) * pct / 100;
+    for (int i = 0; i < 8; i++)
+        for (int t = r + S + 1; t < r + S + 1 + len; t++) {
+            int px = cx + dir[i][0] * t / 2, py = cy + dir[i][1] * t / 2;
+            if (dir[i][0] && dir[i][1]) { px = cx + dir[i][0] * t * 7 / 10; py = cy + dir[i][1] * t * 7 / 10; }
+            zwm_fill(s, px - S / 2, py - S / 2, S, S, col);
+        }
+}
+
 /* ---- the bar ---------------------------------------------------------------------- */
 
-enum { ITEM_SYS, ITEM_APP, ITEM_VOL, ITEM_CLOCK, NITEMS };
+enum { ITEM_SYS, ITEM_APP, ITEM_BRIGHT, ITEM_VOL, ITEM_CLOCK, NITEMS };
 static int item_x[NITEMS], item_w[NITEMS];
 static int hover = -1, open_item = -1;
 static char clock_text[40];
@@ -152,6 +224,8 @@ static void layout(void)
     item_x[ITEM_CLOCK] = bs->w - 4 * S - item_w[ITEM_CLOCK];
     item_w[ITEM_VOL] = volume < 0 ? 0 : 16 * S + zwm_ttext_width("100%", px) + 2 * PAD;
     item_x[ITEM_VOL] = item_x[ITEM_CLOCK] - item_w[ITEM_VOL];
+    item_w[ITEM_BRIGHT] = panel < 0 ? 0 : 16 * S + zwm_ttext_width("100%", px) + 2 * PAD;
+    item_x[ITEM_BRIGHT] = item_x[ITEM_VOL] - item_w[ITEM_BRIGHT];
 }
 
 static void draw_bar(void)
@@ -169,6 +243,14 @@ static void draw_bar(void)
         case ITEM_SYS:   zwm_ttext_w(bs, x, ty, "sic", ZWM_COL_TEXT, px, ZWM_FONT_MEDIUM); break;
         case ITEM_APP:   zwm_ttext_w(bs, x, ty, app_name, ZWM_COL_TEXT, px, ZWM_FONT_MEDIUM); break;
         case ITEM_CLOCK: zwm_ttext(bs, x, ty, clock_text, ZWM_COL_TEXT, px); break;
+        case ITEM_BRIGHT: {
+            draw_sun(bs, x, (BAR_H - 14 * S) / 2, 14 * S, brightness, ZWM_COL_TEXT);
+            char pct[8];
+            if (brightness >= 0) snprintf(pct, sizeof pct, "%d%%", brightness);
+            else snprintf(pct, sizeof pct, "-");
+            zwm_ttext(bs, x + 18 * S, ty, pct, ZWM_COL_TEXT_DIM, px);
+            break;
+        }
         case ITEM_VOL: {
             draw_speaker(bs, x, (BAR_H - 14 * S) / 2, 14 * S, volume, ZWM_COL_TEXT);
             char pct[8];
@@ -198,7 +280,7 @@ static int pop = -1;                    /* the open menu's window */
 static zwm_surface *ps;
 static struct entry entries[8];
 static int nentries, pop_hover = -1, pop_target = -1;
-static int dragging;                    /* the volume slider */
+static int dragging;                    /* the volume or brightness slider */
 
 static int slider_x0(void) { return 40 * S; }
 static int slider_x1(void) { return VOL_W - 50 * S; }
@@ -208,16 +290,19 @@ static void draw_pop(void)
     zwm_fill(ps, 0, 0, ps->w, ps->h, ZWM_COL_WINDOW);
     zwm_rect(ps, 0, 0, ps->w, ps->h, ZWM_COL_BORDER);
     int px = ZWM_UI_PX;
-    if (open_item == ITEM_VOL) {
-        int cy = ps->h / 2;
-        if (pop_hover == 0) zwm_round_rect(ps, 6 * S, cy - 14 * S, 28 * S, 28 * S, 6 * S, ZWM_COL_SURFACE);
-        draw_speaker(ps, 10 * S, cy - 9 * S, 18 * S, volume, ZWM_COL_TEXT);
-        int x0 = slider_x0(), x1 = slider_x1(), at = x0 + (x1 - x0) * volume / 100;
+    if (open_item == ITEM_VOL || open_item == ITEM_BRIGHT) {
+        int cy = ps->h / 2, value = open_item == ITEM_VOL ? volume : brightness < 0 ? 50 : brightness;
+        if (open_item == ITEM_VOL) {
+            if (pop_hover == 0) zwm_round_rect(ps, 6 * S, cy - 14 * S, 28 * S, 28 * S, 6 * S, ZWM_COL_SURFACE);
+            draw_speaker(ps, 10 * S, cy - 9 * S, 18 * S, volume, ZWM_COL_TEXT);
+        } else draw_sun(ps, 10 * S, cy - 9 * S, 18 * S, value, ZWM_COL_TEXT);
+        int x0 = slider_x0(), x1 = slider_x1(), at = x0 + (x1 - x0) * value / 100;
         zwm_round_rect(ps, x0, cy - 2 * S, x1 - x0, 4 * S, 2 * S, ZWM_COL_ACCENT_DIM);
         zwm_round_rect(ps, x0, cy - 2 * S, at - x0 + 2 * S, 4 * S, 2 * S, ZWM_COL_ACCENT);
         zwm_disc(ps, at, cy, 7 * S, ZWM_COL_ACCENT);
         char pct[8];
-        snprintf(pct, sizeof pct, "%d%%", volume);
+        if (open_item == ITEM_BRIGHT && brightness < 0) snprintf(pct, sizeof pct, "-");
+        else snprintf(pct, sizeof pct, "%d%%", value);
         zwm_ttext(ps, x1 + 14 * S, cy - zwm_ttext_height(px) / 2, pct, ZWM_COL_TEXT, px);
         return;
     }
@@ -257,10 +342,13 @@ static void open_pop(int item)
     } else if (item == ITEM_VOL) {
         volume_read();
         w = VOL_W;
+    } else if (item == ITEM_BRIGHT) {
+        brightness_read();
+        w = VOL_W;
     } else {
         return;
     }
-    h = item == ITEM_VOL ? VOL_H : nentries * ROW_H + 8 * S;
+    h = item == ITEM_VOL || item == ITEM_BRIGHT ? VOL_H : nentries * ROW_H + 8 * S;
     struct zwm_m_geom g;
     pop = zwm_create(c, w, h, "menu", ZWM_UNDECORATED, &g);
     if (pop < 0) { pop = -1; return; }
@@ -296,15 +384,19 @@ static void slider_to(int x)
 {
     int x0 = slider_x0(), x1 = slider_x1();
     int v = (x - x0) * 100 / (x1 - x0);
+    if (open_item == ITEM_BRIGHT) { brightness_set(v); return; }
     volume_set(v);
     if (volume > 0) unmuted = volume;
 }
 
+/* The slider's value saved where the next session finds it. */
+static void slider_save(void) { if (open_item == ITEM_BRIGHT) brightness_save(); else volume_save(); }
+
 static void pop_mouse(const struct zwm_m_mouse *m)
 {
-    if (open_item == ITEM_VOL) {
+    if (open_item == ITEM_VOL || open_item == ITEM_BRIGHT) {
         int cy = ps->h / 2;
-        int on_button = m->x >= 6 * S && m->x < 34 * S && m->y >= cy - 14 * S && m->y < cy + 14 * S;
+        int on_button = open_item == ITEM_VOL && m->x >= 6 * S && m->x < 34 * S && m->y >= cy - 14 * S && m->y < cy + 14 * S;
         pop_hover = on_button ? 0 : -1;
         if (m->kind == ZWM_MOUSE_PRESS && (m->buttons & ZWM_BTN_LEFT)) {
             if (on_button) { volume_set(volume > 0 ? 0 : unmuted); volume_save(); }
@@ -313,7 +405,7 @@ static void pop_mouse(const struct zwm_m_mouse *m)
             slider_to(m->x);
         } else if (m->kind == ZWM_MOUSE_RELEASE && dragging) {
             dragging = 0;
-            volume_save();
+            slider_save();
         }
         return;
     }
@@ -339,6 +431,7 @@ int main(void)
     bar_y = g.y;                    /* below a camera cutout, on a phone */
     bs = zwm_window_surface(c, bar, g.w, g.h);
     volume_load();
+    brightness_load();
     clock_update();
     draw_bar();
     zwm_flush(c, bar, bs);
@@ -354,10 +447,12 @@ int main(void)
                 if (ev.type == ZWM_S_MOUSE) { pop_mouse(&ev.mouse); pop_dirty = 1; }
                 else if (ev.type == ZWM_S_KEY && ev.key.down && ev.key.sym == 27) close_pop();
                 else if (ev.type == ZWM_S_FOCUS && !ev.focus.focused) close_pop();
-                else if (ev.type == ZWM_S_KEY && ev.key.down && open_item == ITEM_VOL &&
+                else if (ev.type == ZWM_S_KEY && ev.key.down && (open_item == ITEM_VOL || open_item == ITEM_BRIGHT) &&
                          (ev.key.sym == ZWM_KEY_LEFT || ev.key.sym == ZWM_KEY_RIGHT)) {
-                    volume_set(volume + (ev.key.sym == ZWM_KEY_RIGHT ? 5 : -5));
-                    volume_save();
+                    int step = ev.key.sym == ZWM_KEY_RIGHT ? 5 : -5;
+                    if (open_item == ITEM_VOL) volume_set(volume + step);
+                    else brightness_set((brightness < 0 ? 50 : brightness) + step);
+                    slider_save();
                     pop_dirty = 1;
                 }
                 continue;
