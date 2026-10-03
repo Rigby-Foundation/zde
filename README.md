@@ -35,7 +35,8 @@ size they ask for.
 
 Icons: `icons/mkicon.py` draws each app's icon (96x96 RGBA, oversampled
 shapes) and the build puts it into the program as a `.zicon` ELF section
-(`llvm-objcopy --add-section`), which `zwm_icon_load` reads back; Files,
+(`llvm-objcopy --add-section`, flagged allocated so `strip` keeps it),
+which `zwm_icon_load` reads back; Files,
 the dock and the launchpad all show it. The generic ones (folder, doc,
 image, app) go to `/usr/share/icons`. `mkicon.py --game <dir>` takes a
 Ren'Py game's `gui/window_icon.png` (plain or inside an `.rpa`), which is

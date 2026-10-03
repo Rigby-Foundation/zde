@@ -166,7 +166,7 @@ $(BUILD)/.staged: $(BUILD)/renpy $(SRC)/.sic-port
 	rm -rf $(ROOT)
 	@mkdir -p $(ROOT)/bin $(ROOT)/usr/lib/renpy/pygame_sdl2 $(ROOT)/usr/lib/python2.7/site-packages
 	cp $(BUILD)/renpy $(ROOT)/bin/renpy && $(STRIP) $(ROOT)/bin/renpy
-	python3 ../../icons/mkicon.py renpy $(BUILD)/renpy.zicon && $(OBJCOPY) --add-section .zicon=$(BUILD)/renpy.zicon $(ROOT)/bin/renpy   # its icon (Files, the launchpad)
+	python3 ../../icons/mkicon.py renpy $(BUILD)/renpy.zicon && $(OBJCOPY) --add-section .zicon=$(BUILD)/renpy.zicon --set-section-flags .zicon=alloc,readonly $(ROOT)/bin/renpy   # its icon (Files, the launchpad)
 	cp $(RP)/renpy.py $(ROOT)/usr/lib/renpy/
 	cp -R $(RP)/renpy $(ROOT)/usr/lib/renpy/renpy
 	cd $(ROOT)/usr/lib/renpy/renpy && find . \( -name '*.pyx' -o -name '*.pxd' -o -name '*.pyo' -o -name '*.pyc' \) -delete

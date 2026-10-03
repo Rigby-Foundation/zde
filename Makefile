@@ -65,6 +65,9 @@ all: $(ELFS) $(SDL_ELFS)
 # App icons: icons/mkicon.py draws them; a program named like one gets it
 # as a `.zicon` section after linking (zwm_icon_load reads it back), and
 # they all go to /usr/share/icons for Files' generic ones (folder, doc, ...).
+# The section is marked allocated so `strip` keeps it (outside every
+# segment, the loader never maps it); unallocated, a stripped program has
+# no icon and the launchpad leaves it out.
 OBJCOPY := $(if $(LLVM_PREFIX),$(LLVM_PREFIX)/bin/llvm-objcopy,llvm-objcopy)
 ICON_NAMES := $(shell python3 icons/mkicon.py --list)
 ICON_FILES := $(patsubst %,$(BUILD)/icons/%.zicon,$(ICON_NAMES))
@@ -72,7 +75,7 @@ $(BUILD)/icons/%.zicon: icons/mkicon.py
 	@mkdir -p $(dir $@)
 	python3 icons/mkicon.py $* $@
 icons: $(ICON_FILES)
-add-icon = $(if $(filter $(notdir $(1)),$(ICON_NAMES)),$(OBJCOPY) --add-section .zicon=$(BUILD)/icons/$(notdir $(1)).zicon $(1),true)
+add-icon = $(if $(filter $(notdir $(1)),$(ICON_NAMES)),$(OBJCOPY) --add-section .zicon=$(BUILD)/icons/$(notdir $(1)).zicon --set-section-flags .zicon=alloc,readonly $(1),true)
 
 ports:
 	@for p in $(PORTS); do $(MAKE) -C ports/$$p install || exit 1; done
