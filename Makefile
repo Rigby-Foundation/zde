@@ -75,7 +75,8 @@ $(BUILD)/icons/%.zicon: icons/mkicon.py
 	@mkdir -p $(dir $@)
 	python3 icons/mkicon.py $* $@
 icons: $(ICON_FILES)
-add-icon = $(if $(filter $(notdir $(1)),$(ICON_NAMES)),$(OBJCOPY) --add-section .zicon=$(BUILD)/icons/$(notdir $(1)).zicon --set-section-flags .zicon=alloc,readonly $(1),true)
+comma := ,
+add-icon = $(if $(filter $(notdir $(1)),$(ICON_NAMES)),$(OBJCOPY) --add-section .zicon=$(BUILD)/icons/$(notdir $(1)).zicon --set-section-flags .zicon=alloc$(comma)readonly $(1),true)
 
 ports:
 	@for p in $(PORTS); do $(MAKE) -C ports/$$p install || exit 1; done
