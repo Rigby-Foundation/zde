@@ -1,9 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright (C) 2026 Rigby Foundation */
-/* zterm: a terminal window running /bin/sh over pipes. There is no pty on
- * sic, so the terminal does the line editing and the echo itself and hands
- * the shell whole lines; the shell's output is drawn into a character
- * grid (ANSI escape sequences are skipped, not interpreted). */
+/* zterm: a terminal window running /bin/sh over a pseudo-terminal (PTY). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +10,8 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <pty.h>
 #include <zwm.h>
 
 #define S   zwm_scale()
@@ -28,9 +27,9 @@ static zwm *c;
 static int win;
 static pid_t sh_pid;
 static int to_sh = -1, from_sh = -1;
-static char line[512];          /* the line being edited */
-static int line_len;
-static int esc;                 /* inside an escape sequence */
+static int esc_state;           /* 0 = normal, 1 = ESC, 2 = ESC [ */
+static int csi_params[4];
+static int csi_nparams;
 static int dirty_all, focused = 1;
 
 static void grid_alloc(int nc, int nr)
@@ -57,12 +56,90 @@ static void scroll(void)
 
 static void putch(char ch)
 {
-    if (esc) {                                  /* ESC [ ... final byte in @-~ */
-        if (ch >= 0x40 && ch <= 0x7E && ch != '[') esc = 0;
+    if (esc_state == 1) {
+        if (ch == '[') {
+            esc_state = 2;
+            csi_nparams = 0;
+            csi_params[0] = csi_params[1] = csi_params[2] = csi_params[3] = 0;
+            return;
+        }
+        esc_state = 0;
         return;
     }
+    if (esc_state == 2) {
+        if (ch >= '0' && ch <= '9') {
+            csi_params[csi_nparams] = csi_params[csi_nparams] * 10 + (ch - '0');
+            return;
+        }
+        if (ch == ';') {
+            if (csi_nparams < 3) csi_nparams++;
+            return;
+        }
+        if (ch == '?') return; /* ignore private mode marker */
+        esc_state = 0;
+        int p0 = csi_params[0];
+        int p1 = csi_params[1];
+        if (ch == 'K') { /* erase in line */
+            if (p0 == 0) {
+                for (int x = cx; x < cols; x++) grid[(size_t)cy * cols + x] = ' ';
+            } else if (p0 == 1) {
+                for (int x = 0; x <= cx && x < cols; x++) grid[(size_t)cy * cols + x] = ' ';
+            } else if (p0 == 2) {
+                for (int x = 0; x < cols; x++) grid[(size_t)cy * cols + x] = ' ';
+            }
+            dirty_all = 1;
+            return;
+        }
+        if (ch == 'J') { /* erase display */
+            if (p0 == 2) {
+                memset(grid, ' ', (size_t)cols * rows);
+                cx = cy = 0;
+            } else if (p0 == 0) {
+                for (int x = cx; x < cols; x++) grid[(size_t)cy * cols + x] = ' ';
+                for (int y = cy + 1; y < rows; y++)
+                    memset(grid + (size_t)y * cols, ' ', (size_t)cols);
+            }
+            dirty_all = 1;
+            return;
+        }
+        if (ch == 'A') { /* cursor up */
+            int n = p0 ? p0 : 1;
+            cy = (cy >= n) ? cy - n : 0;
+            dirty_all = 1;
+            return;
+        }
+        if (ch == 'B') { /* cursor down */
+            int n = p0 ? p0 : 1;
+            cy = (cy + n < rows) ? cy + n : rows - 1;
+            dirty_all = 1;
+            return;
+        }
+        if (ch == 'C') { /* cursor forward */
+            int n = p0 ? p0 : 1;
+            cx = (cx + n < cols) ? cx + n : cols - 1;
+            dirty_all = 1;
+            return;
+        }
+        if (ch == 'D') { /* cursor back */
+            int n = p0 ? p0 : 1;
+            cx = (cx >= n) ? cx - n : 0;
+            dirty_all = 1;
+            return;
+        }
+        if (ch == 'H' || ch == 'f') { /* cursor position: row;col (1-based) */
+            int r = p0 ? p0 - 1 : 0;
+            int c_pos = p1 ? p1 - 1 : 0;
+            if (r < 0) r = 0; if (r >= rows) r = rows - 1;
+            if (c_pos < 0) c_pos = 0; if (c_pos >= cols) c_pos = cols - 1;
+            cy = r; cx = c_pos;
+            dirty_all = 1;
+            return;
+        }
+        return;
+    }
+
     switch (ch) {
-    case 27: esc = 1; return;
+    case 27: esc_state = 1; return;
     case '\n': cx = 0; if (++cy >= rows) { cy = rows - 1; scroll(); } return;
     case '\r': cx = 0; return;
     case '\b': if (cx > 0) cx--; return;
@@ -98,47 +175,76 @@ static void draw(void)
 
 static void start_shell(void)
 {
-    int in[2], out[2];
-    if (pipe(in) || pipe(out)) { perror("pipe"); exit(1); }
+    int master, slave;
+    struct winsize ws = { .ws_row = (uint16_t)rows, .ws_col = (uint16_t)cols, .ws_xpixel = 0, .ws_ypixel = 0 };
+    if (openpty(&master, &slave, NULL, NULL, &ws) < 0) {
+        perror("openpty");
+        exit(1);
+    }
     sh_pid = fork();
     if (sh_pid == 0) {
-        dup2(in[0], 0); dup2(out[1], 1); dup2(out[1], 2);
-        close(in[0]); close(in[1]); close(out[0]); close(out[1]);
-        setenv("TERM", "dumb", 1);
-        execl("/bin/sh", "sh", (char *)NULL);
+        dup2(slave, 0); dup2(slave, 1); dup2(slave, 2);
+        close(master); close(slave);
+        setenv("TERM", "vt100", 1);
+        execl("/bin/sh", "sh", "-i", (char *)NULL);
         _exit(127);
     }
-    close(in[0]); close(out[1]);
-    to_sh = in[1]; from_sh = out[0];
+    close(slave);
+    to_sh = from_sh = master;
     fcntl(from_sh, F_SETFL, fcntl(from_sh, F_GETFL) | O_NONBLOCK);
 }
 
 static void key(const struct zwm_m_key *k)
 {
-    if (!k->down) return;
+    if (!k->down || to_sh < 0) return;
     uint32_t sym = k->sym;
     if (k->mods & ZWM_MOD_CTRL) {
-        if (sym == 'd' || sym == 'D') { if (line_len == 0) { close(to_sh); to_sh = -1; } return; }
-        if (sym == 'c' || sym == 'C') { const char *m = "^C\n"; for (const char *q = m; *q; q++) putch(*q); line_len = 0; return; }
-        if (sym == 'l' || sym == 'L') { memset(grid, ' ', (size_t)cols * rows); cx = cy = 0; dirty_all = 1; return; }
+        if (sym == 'c' || sym == 'C') { char c_code = 3; write(to_sh, &c_code, 1); return; }
+        if (sym == 'd' || sym == 'D') { char c_code = 4; write(to_sh, &c_code, 1); return; }
+        if (sym == 'z' || sym == 'Z') { char c_code = 26; write(to_sh, &c_code, 1); return; }
+        if (sym == 'l' || sym == 'L') { char c_code = 12; write(to_sh, &c_code, 1); return; }
+        if (sym >= 'a' && sym <= 'z') { char c_code = (char)(sym - 'a' + 1); write(to_sh, &c_code, 1); return; }
+        if (sym >= 'A' && sym <= 'Z') { char c_code = (char)(sym - 'A' + 1); write(to_sh, &c_code, 1); return; }
+        if (sym == '[' || sym == '{') { char c_code = 27; write(to_sh, &c_code, 1); return; }
+        if (sym == '\\' || sym == '|') { char c_code = 28; write(to_sh, &c_code, 1); return; }
+        if (sym == ']' || sym == '}') { char c_code = 29; write(to_sh, &c_code, 1); return; }
         return;
     }
-    if (sym == '\b') {
-        if (line_len) { line_len--; putch('\b'); grid[(size_t)cy * cols + cx] = ' '; }
+    if (k->mods & ZWM_MOD_ALT) {
+        if (sym == ZWM_KEY_LEFT) { write(to_sh, "\033b", 2); return; }
+        if (sym == ZWM_KEY_RIGHT) { write(to_sh, "\033f", 2); return; }
+        if (sym >= 0x20 && sym < 0x7F) {
+            char buf[2] = { '\033', (char)sym };
+            write(to_sh, buf, 2);
+            return;
+        }
+    }
+    if (sym == 27) { write(to_sh, "\033", 1); return; }
+    if (sym == ZWM_KEY_UP) { write(to_sh, "\033[A", 3); return; }
+    if (sym == ZWM_KEY_DOWN) { write(to_sh, "\033[B", 3); return; }
+    if (sym == ZWM_KEY_RIGHT) { write(to_sh, "\033[C", 3); return; }
+    if (sym == ZWM_KEY_LEFT) { write(to_sh, "\033[D", 3); return; }
+    if (sym == ZWM_KEY_HOME) { write(to_sh, "\033[H", 3); return; }
+    if (sym == ZWM_KEY_END) { write(to_sh, "\033[F", 3); return; }
+    if (sym == ZWM_KEY_PGUP) { write(to_sh, "\033[5~", 4); return; }
+    if (sym == ZWM_KEY_PGDN) { write(to_sh, "\033[6~", 4); return; }
+    if (sym == ZWM_KEY_INSERT) { write(to_sh, "\033[2~", 4); return; }
+    if (sym == ZWM_KEY_DELETE) { write(to_sh, "\033[3~", 4); return; }
+    if (sym == '\b' || sym == 127) {
+        write(to_sh, "\b", 1);
         return;
     }
-    if (sym == '\n') {
-        if (to_sh < 0) return;
-        line[line_len++] = '\n';
-        putch('\n');
-        const char *p = line; size_t left = (size_t)line_len;
-        while (left) { ssize_t n = write(to_sh, p, left); if (n <= 0) break; p += n; left -= (size_t)n; }
-        line_len = 0;
+    if (sym == '\n' || sym == '\r') {
+        write(to_sh, "\n", 1);
         return;
     }
-    if (sym >= 0x20 && sym < 0x7F && line_len < (int)sizeof line - 2) {
-        line[line_len++] = (char)sym;
-        putch((char)sym);
+    if (sym == '\t') {
+        write(to_sh, "\t", 1);
+        return;
+    }
+    if (sym >= 0x20 && sym < 0x7F) {
+        char ch = (char)sym;
+        write(to_sh, &ch, 1);
     }
 }
 
@@ -164,9 +270,9 @@ int main(void)
             char buf[1024];
             ssize_t n;
             while ((n = read(from_sh, buf, sizeof buf)) > 0) { for (ssize_t i = 0; i < n; i++) putch(buf[i]); changed = 1; }
-            if (n == 0) {                       /* the shell is gone */
+            if (n == 0 || (n < 0 && errno == EIO)) {                       /* the shell is gone */
                 const char *m = "[shell exited]"; for (const char *q = m; *q; q++) putch(*q);
-                close(from_sh); from_sh = -1; changed = 1;
+                close(from_sh); from_sh = to_sh = -1; changed = 1;
             }
         }
         zwm_event ev; int r;
@@ -177,6 +283,10 @@ int main(void)
             case ZWM_S_RESIZE:
                 zwm_surface_resize(s, ev.geom.w, ev.geom.h);
                 grid_alloc((ev.geom.w - 2 * PAD) / CW, (ev.geom.h - 2 * PAD) / CH);
+                if (to_sh >= 0) {
+                    struct winsize ws = { .ws_row = (uint16_t)rows, .ws_col = (uint16_t)cols, .ws_xpixel = 0, .ws_ypixel = 0 };
+                    ioctl(to_sh, TIOCSWINSZ, &ws);
+                }
                 changed = 1; break;
             case ZWM_S_CLOSE: goto out;
             }
@@ -185,6 +295,7 @@ int main(void)
         if (changed || dirty_all) draw();
     }
 out:
+    if (to_sh >= 0) close(to_sh);
     if (sh_pid > 0) kill(sh_pid, SIGKILL);
     zwm_destroy(c, win);
     return 0;
