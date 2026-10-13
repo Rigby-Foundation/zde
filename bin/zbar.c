@@ -265,19 +265,245 @@ static void draw_keyboard(zwm_surface *s, int x, int y, int h, uint32_t col)
 
 /* ---- the Wi-Fi ---------------------------------------------------------------------- */
 
+#define COL_MAC_BLUE  ZWM_RGB(0x00, 0x7a, 0xff)
+#define COL_MAC_GRAY  ZWM_RGB(0x3a, 0x3a, 0x3c)
+#define COL_MAC_HOVER ZWM_RGB(0x2c, 0x2c, 0x30)
+#define WIFI_POP_W    (270 * S)
+#define WIFI_FILE     "/disk/.wifi"
+#define WIFI_TMP_FILE "/tmp/.wifi"
+
 static int wifi = -1;               /* -1: no /dev/wlan; 0 off; 1 starting; 2 on; 3 failed */
+
+static void draw_lock(zwm_surface *s, int x, int y, uint32_t col)
+{
+    zwm_round_rect_border(s, x + 2 * S, y, 6 * S, 7 * S, 3 * S, col);
+    zwm_round_rect(s, x, y + 5 * S, 10 * S, 7 * S, 2 * S, col);
+}
+
+#define MAX_WIFI_NETS 32
+struct wifi_net {
+    char ssid[33];
+    int dbm;
+    int secure;
+};
+
+static struct wifi_net wifi_nets[MAX_WIFI_NETS];
+static int wifi_nnets;
+static char wifi_state[24] = "off";
+static char wifi_detail[160];
+static char wifi_connected[33];
+static int wifi_chosen = -1;
+static char wifi_pass[64];
+static int wifi_show_pass = 0;
+
+struct known_wifi {
+    char ssid[33];
+    char pass[64];
+};
+static struct known_wifi known_wifis[16];
+static int nknown_wifis;
+
+enum {
+    WIFI_HIT_NONE,
+    WIFI_HIT_TOGGLE,
+    WIFI_HIT_NET,
+    WIFI_HIT_PASS_FIELD,
+    WIFI_HIT_CONNECT,
+    WIFI_HIT_CANCEL,
+    WIFI_HIT_SHOW_PASS,
+    WIFI_HIT_SETTINGS,
+};
+
+struct wifi_hit {
+    int x, y, w, h;
+    int what;
+    int arg;
+};
+static struct wifi_hit wifi_hits[32];
+static int nwifi_hits;
+static int wifi_hover_what = -1, wifi_hover_arg = -1;
+
+static void add_wifi_hit(int x, int y, int w, int h, int what, int arg)
+{
+    if (nwifi_hits < 32) wifi_hits[nwifi_hits++] = (struct wifi_hit){ x, y, w, h, what, arg };
+}
+
+static int wifi_is_known(const char *ssid)
+{
+    for (int i = 0; i < nknown_wifis; i++)
+        if (!strcmp(known_wifis[i].ssid, ssid)) return 1;
+    return 0;
+}
+
+static const char *wifi_get_saved_pass(const char *ssid)
+{
+    for (int i = 0; i < nknown_wifis; i++)
+        if (!strcmp(known_wifis[i].ssid, ssid)) return known_wifis[i].pass;
+    return NULL;
+}
+
+static void wifi_load_known(void)
+{
+    nknown_wifis = 0;
+    int fd = open(WIFI_FILE, O_RDONLY);
+    if (fd < 0) fd = open(WIFI_TMP_FILE, O_RDONLY);
+    if (fd >= 0) {
+        char buf[1024];
+        ssize_t n = read(fd, buf, sizeof buf - 1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = 0;
+            char *save = NULL;
+            for (char *l = strtok_r(buf, "\n", &save); l; l = strtok_r(NULL, "\n", &save)) {
+                char *tab = strchr(l, '\t');
+                if (tab && nknown_wifis < 16) {
+                    *tab = 0;
+                    snprintf(known_wifis[nknown_wifis].ssid, sizeof known_wifis[0].ssid, "%s", l);
+                    snprintf(known_wifis[nknown_wifis].pass, sizeof known_wifis[0].pass, "%s", tab + 1);
+                    nknown_wifis++;
+                }
+            }
+        }
+    }
+    if (!wifi_is_known("ByteNode5G") && nknown_wifis < 16) {
+        snprintf(known_wifis[nknown_wifis].ssid, sizeof known_wifis[0].ssid, "ByteNode5G");
+        snprintf(known_wifis[nknown_wifis].pass, sizeof known_wifis[0].pass, "03081977");
+        nknown_wifis++;
+    }
+}
+
+static void wifi_save_known(const char *ssid, const char *pass)
+{
+    if (!ssid || !ssid[0]) return;
+    int found = -1;
+    for (int i = 0; i < nknown_wifis; i++) {
+        if (!strcmp(known_wifis[i].ssid, ssid)) { found = i; break; }
+    }
+    if (found >= 0) {
+        snprintf(known_wifis[found].pass, sizeof known_wifis[0].pass, "%s", pass ? pass : "");
+    } else if (nknown_wifis < 16) {
+        snprintf(known_wifis[nknown_wifis].ssid, sizeof known_wifis[0].ssid, "%s", ssid);
+        snprintf(known_wifis[nknown_wifis].pass, sizeof known_wifis[0].pass, "%s", pass ? pass : "");
+        nknown_wifis++;
+    }
+    int fd = open(WIFI_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) fd = open(WIFI_TMP_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        for (int i = 0; i < nknown_wifis; i++) {
+            char line[128];
+            int n = snprintf(line, sizeof line, "%s\t%s\n", known_wifis[i].ssid, known_wifis[i].pass);
+            write(fd, line, (size_t)n);
+        }
+        close(fd);
+    }
+}
+
+static void spawn_dhcp(void)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        usleep(400000);
+        execl("/bin/dhcp", "dhcp", "-t", "15", "wlan0", (char *)NULL);
+        _exit(127);
+    }
+}
+
+static void spawn_dhcp_waiter(void)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        for (int i = 0; i < 40; i++) {
+            usleep(500000);
+            int fd = open("/dev/wlan", O_RDONLY);
+            if (fd >= 0) {
+                char buf[512];
+                ssize_t n = read(fd, buf, sizeof buf - 1);
+                close(fd);
+                if (n > 0) {
+                    buf[n] = 0;
+                    if (strstr(buf, ": connected")) {
+                        usleep(300000);
+                        execl("/bin/dhcp", "dhcp", "-t", "15", "wlan0", (char *)NULL);
+                        _exit(0);
+                    }
+                    if (strstr(buf, "failed")) break;
+                }
+            }
+        }
+        _exit(1);
+    }
+}
+
+static char dhcp_done_for[33];
+
+static void wifi_read_full(void)
+{
+    char buf[4096];
+    int fd = open("/dev/wlan", O_RDONLY);
+    if (fd < 0) { wifi = -1; wifi_nnets = 0; return; }
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n < 0) n = 0;
+    buf[n] = 0;
+    wifi_nnets = 0;
+    wifi_connected[0] = 0;
+    wifi_state[0] = 0;
+    wifi_detail[0] = 0;
+    char *save = NULL;
+    for (char *l = strtok_r(buf, "\n", &save); l; l = strtok_r(NULL, "\n", &save)) {
+        if (!strncmp(l, "state ", 6)) {
+            snprintf(wifi_state, sizeof wifi_state, "%s", l + 6);
+        } else if (!strncmp(l, "connected ", 10)) {
+            snprintf(wifi_connected, sizeof wifi_connected, "%s", l + 10);
+        } else if (!strncmp(l, "detail ", 7)) {
+            snprintf(wifi_detail, sizeof wifi_detail, "%s", l + 7);
+            if (!strncmp(wifi_detail, "join ", 5)) {
+                char *colon = strchr(wifi_detail + 5, ':');
+                if (colon && strstr(colon, "connected")) {
+                    int sl = (int)(colon - (wifi_detail + 5));
+                    if (sl > 0 && sl < (int)sizeof wifi_connected) {
+                        memcpy(wifi_connected, wifi_detail + 5, sl);
+                        wifi_connected[sl] = 0;
+                    }
+                }
+            }
+        } else if (!strncmp(l, "net ", 4) && wifi_nnets < MAX_WIFI_NETS) {
+            struct wifi_net *e = &wifi_nets[wifi_nnets];
+            int used = 0;
+            if (sscanf(l + 4, "%d %d %n", &e->dbm, &e->secure, &used) >= 2 && used > 0) {
+                snprintf(e->ssid, sizeof e->ssid, "%s", l + 4 + used);
+                if (e->ssid[0]) {
+                    int dup = 0;
+                    for (int j = 0; j < wifi_nnets; j++) {
+                        if (!strcmp(wifi_nets[j].ssid, e->ssid)) {
+                            if (e->dbm > wifi_nets[j].dbm) wifi_nets[j].dbm = e->dbm;
+                            dup = 1; break;
+                        }
+                    }
+                    if (!dup) wifi_nnets++;
+                }
+            }
+        }
+    }
+    wifi = (!strcmp(wifi_state, "ready") || !strcmp(wifi_state, "connected")) ? 2 :
+           !strcmp(wifi_state, "starting") ? 1 :
+           !strcmp(wifi_state, "failed") ? 3 : 0;
+    if (wifi_connected[0]) wifi = 2;
+    if (wifi_connected[0]) {
+        if (strcmp(wifi_connected, dhcp_done_for) != 0) {
+            snprintf(dhcp_done_for, sizeof dhcp_done_for, "%s", wifi_connected);
+            spawn_dhcp();
+        }
+    } else {
+        dhcp_done_for[0] = 0;
+    }
+}
 
 static void wifi_read(void)
 {
-    char buf[256];
-    int fd = open("/dev/wlan", O_RDONLY);
-    if (fd < 0) { wifi = -1; return; }
-    ssize_t n = read(fd, buf, sizeof buf - 1);
-    close(fd);
-    buf[n > 0 ? n : 0] = 0;
-    wifi = !strncmp(buf, "state ready", 11) || !strncmp(buf, "state connected", 15) ? 2 : !strncmp(buf, "state starting", 14) ? 1 :
-           !strncmp(buf, "state failed", 12) ? 3 : 0;
+    wifi_read_full();
 }
+
 
 /* Three arcs over a dot, a quarter circle wide; dim when the Wi-Fi is off. */
 static void draw_wifi(zwm_surface *s, int x, int y, int size, int st, uint32_t col)
@@ -307,6 +533,7 @@ static void draw_wifi(zwm_surface *s, int x, int y, int size, int st, uint32_t c
 enum { ITEM_SYS, ITEM_APP, ITEM_KBD, ITEM_WIFI, ITEM_BRIGHT, ITEM_VOL, ITEM_BATT, ITEM_CLOCK, NITEMS };
 static int item_x[NITEMS], item_w[NITEMS];
 static int hover = -1, open_item = -1;
+static int screen_h = 2400;
 static char clock_text[40];
 
 static void clock_update(void)
@@ -333,7 +560,7 @@ static void layout(void)
     item_x[ITEM_VOL] = item_x[ITEM_BATT] - item_w[ITEM_VOL];
     item_w[ITEM_BRIGHT] = panel < 0 ? 0 : 16 * S + zwm_ttext_width("100%", px) + 2 * PAD;
     item_x[ITEM_BRIGHT] = item_x[ITEM_VOL] - item_w[ITEM_BRIGHT];
-    item_w[ITEM_WIFI] = wifi < 0 ? 0 : 16 * S + 2 * PAD;
+    item_w[ITEM_WIFI] = wifi < 0 ? 0 : 20 * S + 2 * PAD;
     item_x[ITEM_WIFI] = item_x[ITEM_BRIGHT] - item_w[ITEM_WIFI];
     item_w[ITEM_KBD] = touch_device ? 18 * S + 2 * PAD : 0;
     item_x[ITEM_KBD] = item_x[ITEM_WIFI] - item_w[ITEM_KBD];
@@ -358,7 +585,7 @@ static void draw_bar(void)
             draw_keyboard(bs, x, (BAR_H - 12 * S) / 2, 12 * S, ZWM_COL_TEXT);
             break;
         case ITEM_WIFI:
-            draw_wifi(bs, x, (BAR_H - 16 * S) / 2, 16 * S, wifi, ZWM_COL_TEXT);
+            draw_wifi(bs, x + 2 * S, (BAR_H - 16 * S) / 2, 16 * S, wifi, ZWM_COL_TEXT);
             break;
         case ITEM_BRIGHT: {
             draw_sun(bs, x, (BAR_H - 14 * S) / 2, 14 * S, brightness, ZWM_COL_TEXT);
@@ -388,7 +615,7 @@ static void draw_bar(void)
 
 static int bar_item_at(int x, int y)
 {
-    if (y < 0 || y >= BAR_H) return -1;
+    (void)y;
     for (int i = 0; i < NITEMS; i++)
         if (item_w[i] && x >= item_x[i] && x < item_x[i] + item_w[i]) return i;
     return -1;
@@ -408,12 +635,324 @@ static int dragging;                    /* the volume or brightness slider */
 
 static int slider_x0(void) { return 40 * S; }
 static int slider_x1(void) { return VOL_W - 50 * S; }
+static void open_pop(int item);
+static void close_pop(void);
+static void launch(const char *path);
+
+static void draw_wifi_footer(int y)
+{
+    int px = ZWM_UI_PX;
+    int rx = 6 * S, rw = ps->w - 12 * S, rh = 28 * S;
+    if (wifi_hover_what == WIFI_HIT_SETTINGS) {
+        zwm_round_rect(ps, rx, y, rw, rh, 6 * S, COL_MAC_HOVER);
+    }
+    int fty = y + (rh - zwm_ttext_height(px)) / 2;
+    zwm_ttext(ps, 14 * S, fty, "Wi-Fi Settings...", ZWM_COL_TEXT, px);
+    add_wifi_hit(rx, y, rw, rh, WIFI_HIT_SETTINGS, 0);
+}
+
+static void draw_wifi_row(int idx, int y, int is_conn)
+{
+    int px = ZWM_UI_PX;
+    int rx = 6 * S, rw = ps->w - 12 * S, rh = 30 * S;
+    if (wifi_hover_what == WIFI_HIT_NET && wifi_hover_arg == idx) {
+        zwm_round_rect(ps, rx, y, rw, rh, 6 * S, COL_MAC_HOVER);
+    }
+    add_wifi_hit(rx, y, rw, rh, WIFI_HIT_NET, idx);
+
+    int cx = 20 * S, cy = y + rh / 2;
+    uint32_t badge_col = is_conn ? COL_MAC_BLUE : COL_MAC_GRAY;
+    zwm_disc(ps, cx, cy, 10 * S, badge_col);
+    draw_wifi(ps, cx - 6 * S, cy - 7 * S, 12 * S, 2, is_conn ? 0xffffff : ZWM_COL_TEXT);
+
+    int rty = y + (rh - zwm_ttext_height(px)) / 2;
+    zwm_ttext(ps, 36 * S, rty, wifi_nets[idx].ssid, ZWM_COL_TEXT, px);
+
+    if (wifi_nets[idx].secure) {
+        draw_lock(ps, ps->w - 24 * S, y + (rh - 12 * S) / 2, ZWM_COL_TEXT_DIM);
+    }
+}
+
+static int wifi_pop_height(void)
+{
+    if (wifi <= 0) return 110 * S;
+    if (wifi == 1) return 110 * S;
+    int h = 42 * S;
+    if (wifi_chosen >= 0 && wifi_chosen < wifi_nnets) h += 82 * S;
+    int n_known = 0, n_other = 0;
+    for (int i = 0; i < wifi_nnets; i++) {
+        if (!strcmp(wifi_nets[i].ssid, wifi_connected) || wifi_is_known(wifi_nets[i].ssid)) n_known++;
+        else n_other++;
+    }
+    if (n_known > 0) h += 18 * S + n_known * (32 * S);
+    if (n_other > 0) {
+        int show_other = n_other > 6 ? 6 : n_other;
+        h += 18 * S + show_other * (32 * S);
+    }
+    if (wifi_nnets == 0) h += 30 * S;
+    h += 6 * S + 28 * S + 8 * S;
+    int sh = screen_h > 0 ? screen_h : 2400;
+    int max_h = sh - (bar_y + BAR_H) - 16 * S;
+    if (max_h > 100 * S && h > max_h) h = max_h;
+    if (h < 60 * S) h = 60 * S;
+    return h;
+}
+
+static void draw_wifi_pop(void)
+{
+    int px = ZWM_UI_PX;
+    nwifi_hits = 0;
+    zwm_fill(ps, 0, 0, ps->w, ps->h, ZWM_COL_WINDOW);
+    zwm_rect(ps, 0, 0, ps->w, ps->h, ZWM_COL_BORDER);
+
+    int ty = 8 * S + (20 * S - zwm_ttext_height(px)) / 2;
+    zwm_ttext_w(ps, 14 * S, ty, "Wi-Fi", ZWM_COL_TEXT, px, ZWM_FONT_MEDIUM);
+
+    int sw_w = 34 * S, sw_h = 20 * S, sw_r = 10 * S;
+    int sw_x = ps->w - 14 * S - sw_w;
+    int sw_y = 8 * S;
+    uint32_t sw_col = (wifi == 2 || wifi == 1) ? COL_MAC_BLUE : COL_MAC_GRAY;
+    zwm_round_rect(ps, sw_x, sw_y, sw_w, sw_h, sw_r, sw_col);
+    int thumb_x = (wifi == 2 || wifi == 1) ? (sw_x + sw_w - 10 * S) : (sw_x + 10 * S);
+    zwm_disc(ps, thumb_x, sw_y + 10 * S, 8 * S, 0xffffff);
+    add_wifi_hit(sw_x - 4 * S, sw_y - 2 * S, sw_w + 8 * S, sw_h + 4 * S, WIFI_HIT_TOGGLE, 0);
+
+    int y = 34 * S;
+    zwm_hline(ps, 10 * S, y, ps->w - 20 * S, ZWM_RGB(0x32, 0x32, 0x35));
+    y += 8 * S;
+
+    if (wifi <= 0) {
+        zwm_ttext(ps, 14 * S, y + 4 * S, "Wi-Fi is turned off", ZWM_COL_TEXT_DIM, px);
+        y += 28 * S;
+        zwm_hline(ps, 10 * S, y, ps->w - 20 * S, ZWM_RGB(0x32, 0x32, 0x35));
+        y += 6 * S;
+        draw_wifi_footer(y);
+        return;
+    }
+
+    if (wifi == 1) {
+        zwm_ttext(ps, 14 * S, y + 4 * S, "Turning Wi-Fi on...", ZWM_COL_TEXT_DIM, px);
+        y += 28 * S;
+        zwm_hline(ps, 10 * S, y, ps->w - 20 * S, ZWM_RGB(0x32, 0x32, 0x35));
+        y += 6 * S;
+        draw_wifi_footer(y);
+        return;
+    }
+
+    if (wifi_chosen >= 0 && wifi_chosen < wifi_nnets) {
+        char plabel[64];
+        snprintf(plabel, sizeof plabel, "Password for %s", wifi_nets[wifi_chosen].ssid);
+        zwm_ttext_w(ps, 14 * S, y, plabel, ZWM_COL_TEXT, px, ZWM_FONT_MEDIUM);
+        y += zwm_ttext_height(px) + 6 * S;
+
+        int fw = ps->w - 28 * S - 52 * S;
+        zwm_round_rect(ps, 14 * S, y, fw, 28 * S, 6 * S, ZWM_COL_BG);
+        zwm_round_rect_border(ps, 14 * S, y, fw, 28 * S, 6 * S, ZWM_COL_BORDER);
+
+        char shown[64];
+        size_t n = strlen(wifi_pass);
+        if (wifi_show_pass) snprintf(shown, sizeof shown, "%s", wifi_pass);
+        else { for (size_t i = 0; i < n && i < sizeof shown - 1; i++) shown[i] = '*'; shown[n < sizeof shown - 1 ? n : sizeof shown - 1] = 0; }
+        int pty = y + (28 * S - zwm_ttext_height(px)) / 2;
+        zwm_ttext(ps, 20 * S, pty, shown, ZWM_COL_TEXT, px);
+        zwm_fill(ps, 20 * S + zwm_ttext_width(shown, px) + S, pty, 2 * S, zwm_ttext_height(px), ZWM_COL_TEXT);
+        add_wifi_hit(14 * S, y, fw, 28 * S, WIFI_HIT_PASS_FIELD, 0);
+
+        int sb_col = (wifi_hover_what == WIFI_HIT_SHOW_PASS) ? ZWM_COL_SURFACE : ZWM_COL_WINDOW;
+        zwm_round_rect(ps, 14 * S + fw + 6 * S, y, 46 * S, 28 * S, 6 * S, sb_col);
+        zwm_round_rect_border(ps, 14 * S + fw + 6 * S, y, 46 * S, 28 * S, 6 * S, ZWM_COL_BORDER);
+        const char *sh_txt = wifi_show_pass ? "Hide" : "Show";
+        int stw = zwm_ttext_width(sh_txt, px);
+        zwm_ttext(ps, 14 * S + fw + 6 * S + (46 * S - stw) / 2, pty, sh_txt, ZWM_COL_TEXT, px);
+        add_wifi_hit(14 * S + fw + 6 * S, y, 46 * S, 28 * S, WIFI_HIT_SHOW_PASS, 0);
+        y += 32 * S;
+
+        int bw = (ps->w - 28 * S - 8 * S) / 2;
+        uint32_t c_bg = (wifi_hover_what == WIFI_HIT_CANCEL) ? ZWM_COL_ACCENT_DIM : ZWM_COL_SURFACE;
+        zwm_round_rect(ps, 14 * S, y, bw, 24 * S, 6 * S, c_bg);
+        int ctw = zwm_ttext_width("Cancel", px);
+        zwm_ttext(ps, 14 * S + (bw - ctw) / 2, y + (24 * S - zwm_ttext_height(px)) / 2, "Cancel", ZWM_COL_TEXT, px);
+        add_wifi_hit(14 * S, y, bw, 24 * S, WIFI_HIT_CANCEL, 0);
+
+        zwm_round_rect(ps, 14 * S + bw + 8 * S, y, bw, 24 * S, 6 * S, COL_MAC_BLUE);
+        int contw = zwm_ttext_width_w("Connect", px, ZWM_FONT_MEDIUM);
+        zwm_ttext_w(ps, 14 * S + bw + 8 * S + (bw - contw) / 2, y + (24 * S - zwm_ttext_height(px)) / 2, "Connect", 0xffffff, px, ZWM_FONT_MEDIUM);
+        add_wifi_hit(14 * S + bw + 8 * S, y, bw, 24 * S, WIFI_HIT_CONNECT, 0);
+        y += 32 * S;
+
+        zwm_hline(ps, 10 * S, y, ps->w - 20 * S, ZWM_RGB(0x32, 0x32, 0x35));
+        y += 8 * S;
+    }
+
+    if (wifi_nnets == 0) {
+        zwm_ttext(ps, 14 * S, y + 4 * S, "Scanning for networks...", ZWM_COL_TEXT_DIM, px);
+        y += 28 * S;
+    } else {
+        int has_known_header = 0;
+        for (int i = 0; i < wifi_nnets; i++) {
+            int is_conn = !strcmp(wifi_nets[i].ssid, wifi_connected);
+            int is_known = is_conn || wifi_is_known(wifi_nets[i].ssid);
+            if (!is_known) continue;
+
+            if (!has_known_header) {
+                zwm_ttext(ps, 14 * S, y, "Known Networks", ZWM_COL_TEXT_DIM, px - 2 * S);
+                y += 18 * S;
+                has_known_header = 1;
+            }
+            draw_wifi_row(i, y, is_conn);
+            y += 32 * S;
+        }
+
+        int has_other_header = 0;
+        int shown_other = 0;
+        for (int i = 0; i < wifi_nnets; i++) {
+            int is_conn = !strcmp(wifi_nets[i].ssid, wifi_connected);
+            int is_known = is_conn || wifi_is_known(wifi_nets[i].ssid);
+            if (is_known) continue;
+            if (shown_other >= 6) break;
+
+            if (!has_other_header) {
+                zwm_ttext(ps, 14 * S, y, "Other Networks", ZWM_COL_TEXT_DIM, px - 2 * S);
+                y += 18 * S;
+                has_other_header = 1;
+            }
+            draw_wifi_row(i, y, 0);
+            y += 32 * S;
+            shown_other++;
+        }
+    }
+
+    zwm_hline(ps, 10 * S, y, ps->w - 20 * S, ZWM_RGB(0x32, 0x32, 0x35));
+    y += 6 * S;
+    draw_wifi_footer(y);
+}
+
+static void wifi_pop_mouse(const struct zwm_m_mouse *m)
+{
+    int what = -1, arg = -1;
+    for (int i = 0; i < nwifi_hits; i++) {
+        if (m->x >= wifi_hits[i].x && m->x < wifi_hits[i].x + wifi_hits[i].w &&
+            m->y >= wifi_hits[i].y && m->y < wifi_hits[i].y + wifi_hits[i].h) {
+            what = wifi_hits[i].what;
+            arg = wifi_hits[i].arg;
+            break;
+        }
+    }
+    wifi_hover_what = what;
+    wifi_hover_arg = arg;
+
+    if (m->kind == ZWM_MOUSE_PRESS && (m->buttons & ZWM_BTN_LEFT)) {
+        if (what == WIFI_HIT_TOGGLE) {
+            int fd = open("/dev/wlan", O_WRONLY);
+            if (fd >= 0) {
+                if (wifi > 0) write(fd, "off\n", 4);
+                else write(fd, "on\n", 3);
+                close(fd);
+            }
+            wifi_read_full();
+            open_pop(ITEM_WIFI);
+        } else if (what == WIFI_HIT_NET && arg >= 0 && arg < wifi_nnets) {
+            if (!strcmp(wifi_nets[arg].ssid, wifi_connected)) {
+                /* already connected */
+            } else if (!wifi_nets[arg].secure) {
+                int fd = open("/dev/wlan", O_WRONLY);
+                if (fd >= 0) {
+                    char cmd[128];
+                    int len = snprintf(cmd, sizeof cmd, "connect\t%s\t\n", wifi_nets[arg].ssid);
+                    write(fd, cmd, (size_t)len);
+                    close(fd);
+                }
+                spawn_dhcp_waiter();
+                wifi_chosen = -1;
+                open_pop(ITEM_WIFI);
+            } else {
+                const char *saved = wifi_get_saved_pass(wifi_nets[arg].ssid);
+                if (saved && saved[0]) {
+                    int fd = open("/dev/wlan", O_WRONLY);
+                    if (fd >= 0) {
+                        char cmd[160];
+                        int len = snprintf(cmd, sizeof cmd, "connect\t%s\t%s\n", wifi_nets[arg].ssid, saved);
+                        write(fd, cmd, (size_t)len);
+                        close(fd);
+                    }
+                    spawn_dhcp_waiter();
+                    wifi_chosen = -1;
+                    open_pop(ITEM_WIFI);
+                } else {
+                    wifi_chosen = arg;
+                    wifi_pass[0] = 0;
+                    wifi_show_pass = 0;
+                    open_pop(ITEM_WIFI);
+                }
+            }
+        } else if (what == WIFI_HIT_CONNECT) {
+            if (wifi_chosen >= 0 && wifi_chosen < wifi_nnets) {
+                int fd = open("/dev/wlan", O_WRONLY);
+                if (fd >= 0) {
+                    char cmd[160];
+                    int len = snprintf(cmd, sizeof cmd, "connect\t%s\t%s\n", wifi_nets[wifi_chosen].ssid, wifi_pass);
+                    write(fd, cmd, (size_t)len);
+                    close(fd);
+                }
+                wifi_save_known(wifi_nets[wifi_chosen].ssid, wifi_pass);
+                spawn_dhcp_waiter();
+                wifi_chosen = -1;
+                memset(wifi_pass, 0, sizeof wifi_pass);
+                open_pop(ITEM_WIFI);
+            }
+        } else if (what == WIFI_HIT_CANCEL) {
+            wifi_chosen = -1;
+            memset(wifi_pass, 0, sizeof wifi_pass);
+            open_pop(ITEM_WIFI);
+        } else if (what == WIFI_HIT_SHOW_PASS) {
+            wifi_show_pass = !wifi_show_pass;
+        } else if (what == WIFI_HIT_SETTINGS) {
+            close_pop();
+            launch("/bin/zwifi");
+        }
+    }
+}
+
+static void wifi_pop_key(const struct zwm_m_key *k)
+{
+    if (!k->down) return;
+    if (wifi_chosen >= 0 && wifi_chosen < wifi_nnets) {
+        size_t n = strlen(wifi_pass);
+        if (k->sym == '\b' || k->sym == 127) {
+            if (n) wifi_pass[n - 1] = 0;
+        } else if (k->sym == '\n' || k->sym == '\r') {
+            int fd = open("/dev/wlan", O_WRONLY);
+            if (fd >= 0) {
+                char cmd[160];
+                int len = snprintf(cmd, sizeof cmd, "connect\t%s\t%s\n", wifi_nets[wifi_chosen].ssid, wifi_pass);
+                write(fd, cmd, (size_t)len);
+                close(fd);
+            }
+            wifi_save_known(wifi_nets[wifi_chosen].ssid, wifi_pass);
+            spawn_dhcp_waiter();
+            wifi_chosen = -1;
+            memset(wifi_pass, 0, sizeof wifi_pass);
+            open_pop(ITEM_WIFI);
+        } else if (k->sym == 27) {
+            wifi_chosen = -1;
+            memset(wifi_pass, 0, sizeof wifi_pass);
+            open_pop(ITEM_WIFI);
+        } else if (k->sym >= 32 && k->sym < 127 && n < sizeof wifi_pass - 1) {
+            wifi_pass[n] = (char)k->sym;
+            wifi_pass[n + 1] = 0;
+        }
+    }
+}
 
 static void draw_pop(void)
 {
     zwm_fill(ps, 0, 0, ps->w, ps->h, ZWM_COL_WINDOW);
     zwm_rect(ps, 0, 0, ps->w, ps->h, ZWM_COL_BORDER);
     int px = ZWM_UI_PX;
+    if (open_item == ITEM_WIFI) {
+        draw_wifi_pop();
+        return;
+    }
     if (open_item == ITEM_VOL || open_item == ITEM_BRIGHT) {
         int cy = ps->h / 2, value = open_item == ITEM_VOL ? volume : brightness < 0 ? 50 : brightness;
         if (open_item == ITEM_VOL) {
@@ -469,15 +1008,27 @@ static void open_pop(int item)
     } else if (item == ITEM_BRIGHT) {
         brightness_read();
         w = VOL_W;
+    } else if (item == ITEM_WIFI) {
+        wifi_load_known();
+        wifi_read_full();
+        w = WIFI_POP_W;
+        if (wifi == 2) {
+            int fd = open("/dev/wlan", O_WRONLY);
+            if (fd >= 0) { write(fd, "scan\n", 5); close(fd); }
+        }
     } else {
         return;
     }
-    h = item == ITEM_VOL || item == ITEM_BRIGHT ? VOL_H : nentries * ROW_H + 8 * S;
+    h = item == ITEM_WIFI ? wifi_pop_height() :
+        (item == ITEM_VOL || item == ITEM_BRIGHT) ? VOL_H :
+        nentries * ROW_H + 8 * S;
     struct zwm_m_geom g;
     pop = zwm_create(c, w, h, "menu", ZWM_UNDECORATED, &g);
     if (pop < 0) { pop = -1; return; }
     int x = item_x[item];
+    if (item == ITEM_WIFI) x = item_x[item] + item_w[item] - w;
     if (x + w > bs->w - 4 * S) x = bs->w - 4 * S - w;
+    if (x < 4 * S) x = 4 * S;
     zwm_move(c, pop, x, bar_y + BAR_H);
     ps = zwm_window_surface(c, pop, g.w, g.h);
     if (!ps) { zwm_destroy(c, pop); pop = -1; return; }
@@ -518,6 +1069,10 @@ static void slider_save(void) { if (open_item == ITEM_BRIGHT) brightness_save();
 
 static void pop_mouse(const struct zwm_m_mouse *m)
 {
+    if (open_item == ITEM_WIFI) {
+        wifi_pop_mouse(m);
+        return;
+    }
     if (open_item == ITEM_VOL || open_item == ITEM_BRIGHT) {
         int cy = ps->h / 2;
         int on_button = open_item == ITEM_VOL && m->x >= 6 * S && m->x < 34 * S && m->y >= cy - 14 * S && m->y < cy + 14 * S;
@@ -553,6 +1108,7 @@ int main(void)
     bar = zwm_create(c, 100, BAR_H, "bar", ZWM_DOCK_TOP | ZWM_TASKBAR, &g);
     if (bar < 0) return 1;
     bar_y = g.y;                    /* below a camera cutout, on a phone */
+    if (g.screen_h > 0) screen_h = g.screen_h;
     touch_device = g.screen_h > g.screen_w || access("/dev/panel", F_OK) == 0;
     bs = zwm_window_surface(c, bar, g.w, g.h);
     volume_load();
@@ -572,8 +1128,19 @@ int main(void)
         while ((r = zwm_next_event(c, &ev, 0)) > 0) {
             if (pop >= 0 && (int)ev.win == pop) {
                 if (ev.type == ZWM_S_MOUSE) { pop_mouse(&ev.mouse); pop_dirty = 1; }
-                else if (ev.type == ZWM_S_KEY && ev.key.down && ev.key.sym == 27) close_pop();
+                else if (ev.type == ZWM_S_KEY && ev.key.down && ev.key.sym == 27) {
+                    if (open_item == ITEM_WIFI && wifi_chosen >= 0) {
+                        wifi_chosen = -1; memset(wifi_pass, 0, sizeof wifi_pass);
+                        open_pop(ITEM_WIFI);
+                    } else {
+                        close_pop();
+                    }
+                }
                 else if (ev.type == ZWM_S_FOCUS && !ev.focus.focused) close_pop();
+                else if (ev.type == ZWM_S_KEY && ev.key.down && open_item == ITEM_WIFI) {
+                    wifi_pop_key(&ev.key);
+                    pop_dirty = 1;
+                }
                 else if (ev.type == ZWM_S_KEY && ev.key.down && (open_item == ITEM_VOL || open_item == ITEM_BRIGHT) &&
                          (ev.key.sym == ZWM_KEY_LEFT || ev.key.sym == ZWM_KEY_RIGHT)) {
                     int step = ev.key.sym == ZWM_KEY_RIGHT ? 5 : -5;
@@ -589,9 +1156,6 @@ int main(void)
                 if (ev.mouse.kind == ZWM_MOUSE_PRESS && (ev.mouse.buttons & ZWM_BTN_LEFT) && b == ITEM_KBD) {
                     close_pop();
                     toggle_keyboard();
-                } else if (ev.mouse.kind == ZWM_MOUSE_PRESS && (ev.mouse.buttons & ZWM_BTN_LEFT) && b == ITEM_WIFI) {
-                    close_pop();
-                    launch("/bin/zwifi");
                 } else if (ev.mouse.kind == ZWM_MOUSE_PRESS && (ev.mouse.buttons & ZWM_BTN_LEFT) && b != ITEM_CLOCK && b != ITEM_BATT) {
                     if (b == open_item) close_pop();
                     else if (b >= 0) open_pop(b);
@@ -606,6 +1170,16 @@ int main(void)
             }
         }
         if (r < 0) break;
+        if (pop >= 0 && open_item == ITEM_WIFI) {
+            int old_h = ps ? ps->h : 0;
+            wifi_read_full();
+            int new_h = wifi_pop_height();
+            if (new_h != old_h) {
+                open_pop(ITEM_WIFI);
+            } else {
+                pop_dirty = 1;
+            }
+        }
         if (pop >= 0 && pop_dirty) { draw_pop(); zwm_flush(c, pop, ps); }
         if (pop < 0) volume_read();             /* someone else may have changed it */
         battery_read();
